@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+
+.venv/
+venv/
+
+uploads/
+inference/output/
+
+weights/*.pth
+
+.DS_Store
+Thumbs.db
