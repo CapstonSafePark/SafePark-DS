@@ -1,10 +1,13 @@
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 from PIL import Image
 from lib.config import cfg
 from lib.models import get_net
+
 
 device = torch.device("cpu")
 normalize = transforms.Normalize(
@@ -22,149 +25,214 @@ model.load_state_dict(checkpoint["state_dict"])
 model=model.to(device)
 model.eval()
 
+class LaneCropClassifier(nn.Module):
+    def __init__(self, num_classes=5):
+        super().__init__()
+
+        self.features = nn.Sequential(
+           nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256 * 14 * 14, 256),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(256, num_classes)
+        ) 
+    
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+CROP_CLASSIFIER_PATH = r"C:\Users\olcha\Safepark\SafePark-DS\weights\lane_crop_type_classifier.pth"
+crop_checkpoint = torch.load(CROP_CLASSIFIER_PATH, map_location=device)
+crop_class_names = crop_checkpoint["class_names"]
+crop_classifier = LaneCropClassifier(
+    num_classes=len(crop_class_names)
+)
+crop_classifier.load_state_dict(
+    crop_checkpoint["model_state_dict"]
+)
+crop_classifier = crop_classifier.to(device)
+crop_classifier.eval()
+
+def make_crop_tensor(crop_bgr, size=224):
+    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    crop_rgb = cv2.resize(crop_rgb, (size, size))
+
+    crop_rgb = crop_rgb.astype("float32") / 255.0
+    crop_rgb = np.transpose(crop_rgb, (2, 0, 1))
+
+    tensor = torch.from_numpy(crop_rgb).float()
+    return tensor
+
+def extract_lane_candidate_crops(img_bgr, lane_mask, min_area=120, margin=80):
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        lane_mask.astype("uint8"),
+        connectivity=8
+    )
+
+    h, w = lane_mask.shape
+    crops = []
+
+    for label_idx in range(1, num_labels):
+        area = stats[label_idx, cv2.CC_STAT_AREA]
+
+        if area < min_area:
+            continue
+
+        x = stats[label_idx, cv2.CC_STAT_LEFT]
+        y = stats[label_idx, cv2.CC_STAT_TOP]
+        bw = stats[label_idx, cv2.CC_STAT_WIDTH]
+        bh = stats[label_idx, cv2.CC_STAT_HEIGHT]
+
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(w, x + bw + margin)
+        y2 = min(h, y + bh + margin)
+
+        crop = img_bgr[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            continue
+
+        if crop.shape[0] < 40 or crop.shape[1] < 40:
+            continue
+
+        crops.append({
+            "crop": crop,
+            "box": [int(x1), int(y1), int(x2), int(y2)],
+            "area": int(area)
+        })
+
+    return crops
+
+def classify_lane_crop(crop_bgr):
+    x = make_crop_tensor(crop_bgr, size=224)
+    x = x.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        outputs = crop_classifier(x)
+        probs = F.softmax(outputs, dim=1)
+        confidence, pred_idx = torch.max(probs, dim=1)
+
+    pred_idx = pred_idx.item()
+    confidence = confidence.item()
+
+    line_type = crop_class_names[pred_idx]
+
+    return line_type, confidence
+
+def decide_final_line_type(candidate_results):
+    if not candidate_results:
+        return "none", 0.0
+
+    # confidence 낮은 것은 제외
+    valid = [
+        r for r in candidate_results
+        if r["confidence"] >= 0.55 and r["line_type"] != "none"
+    ]
+
+    if not valid:
+        return "none", 0.0
+
+    # 우선순위: 위험/중요 차선 먼저
+    priority = [
+        "yellow_double",
+        "white_dotted",
+        "yellow_single",
+        "white_solid"
+    ]
+
+    for target in priority:
+        target_results = [
+            r for r in valid
+            if r["line_type"] == target
+        ]
+
+        if target_results:
+            best = max(target_results, key=lambda x: x["confidence"])
+            return target, best["confidence"]
+
+    best = max(valid, key=lambda x: x["confidence"])
+    return best["line_type"], best["confidence"]
+
 def run_lane_detection(image_path):
     img_det = cv2.imread(image_path)
 
     if img_det is None:
-        return{"error"}
+        return {"error": "이미지를 읽을 수 없습니다."}
+
     img_rgb = cv2.cvtColor(img_det, cv2.COLOR_BGR2RGB)
     img_resized = cv2.resize(img_rgb, (640, 640))
+
     img = transform(img_resized).to(device).float()
     img = img.unsqueeze(0)
+
     with torch.no_grad():
         det_out, da_seg_out, ll_seg_out = model(img)
-    ll_seg_mask = ll_seg_out.argmax(dim=1) #0을 배경, 1을 차선으로 설정
-    mask = ll_seg_mask.squeeze().cpu().numpy().astype('uint8') #실사용할 mask 데이터로 변환
+
+    ll_seg_mask = ll_seg_out.argmax(dim=1)
+    mask = ll_seg_mask.squeeze().cpu().numpy().astype("uint8")
+
     h, w = img_det.shape[:2]
-    mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-        
-    #ROI 설정
-    h, w = mask_resized.shape
-    x1 = int(w * 0.02)
-    x2 = int(w * 0.98)
-    y1 = int(h * 0.30)
-    y2 = int(h * 0.95)
-
-    roi_mask = mask_resized[y1:y2, x1:x2]
-    lane_pixels = img_det[mask_resized == 1] #차선 위치인 1만 선택
-
-    #차선 색상 분류
-    roi_img = img_det[y1:y2, x1:x2]
-
-    hsv_roi = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-
-    #노란색 차선
-    yellow_color_mask = (
-        (hsv_roi[:, :, 0] >= 10) &
-        (hsv_roi[:, :, 0] <= 45) &
-        (hsv_roi[:, :, 1] >= 25) &
-        (hsv_roi[:, :, 2] >= 80)
+    mask_resized = cv2.resize(
+        mask,
+        (w, h),
+        interpolation=cv2.INTER_NEAREST
     )
 
-    #흰색 차선
-    white_color_mask = (
-        (hsv_roi[:, :, 1] <= 60) &
-        (hsv_roi[:, :, 2] >= 140)
+    lane_crops = extract_lane_candidate_crops(
+        img_bgr=img_det,
+        lane_mask=mask_resized,
+        min_area=120,
+        margin=80
     )
 
-    yellow_lane_mask = ((roi_mask == 1) & yellow_color_mask).astype('uint8')
-    white_lane_mask = ((roi_mask == 1) & white_color_mask).astype('uint8')
+    candidate_results = []
 
-    kernel = np.ones((3, 3), np.uint8)
+    for item in lane_crops:
+        crop_type, crop_confidence = classify_lane_crop(item["crop"])
 
-    yellow_lane_mask = cv2.dilate(yellow_lane_mask, kernel, iterations = 1)
-    white_lane_mask = cv2.dilate(white_lane_mask, kernel, iterations = 1)
+        candidate_results.append({
+            "line_type": crop_type,
+            "confidence": float(crop_confidence),
+            "box": item["box"],
+            "area": item["area"]
+        })
 
-    #차선 개수 판단
-    def count_lines_by_mask(binary_mask, area_threshold = 200):
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            binary_mask.astype('uint8'),
-            connectivity = 8
-        )
+    line_type, confidence = decide_final_line_type(candidate_results)
 
-        line_count = 0
+    if confidence < 0.65:
+        line_type = "unknown"
 
-        areas = []
-
-        for label_idx in range(1, num_labels):
-            area = stats[label_idx, cv2.CC_STAT_AREA]
-            #이상값으로 추정되는 노이즈는 제외
-            if area > area_threshold:
-                areas.append(area)
-        
-        areas.sort(reverse=True)
-
-        return len(areas), areas
-
-    def is_dotted_line(binary_mask, area_threshold = 200):
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            binary_mask.astype('uint8'),
-            connectivity = 8
-        )
-
-        dotted_candidates = 0
-        solid_candidates = 0
-
-        for label_idx in range(1, num_labels):
-            area = stats[label_idx, cv2.CC_STAT_AREA]
-
-            if area < area_threshold:
-                continue
-                    
-            x = stats[label_idx, cv2.CC_STAT_LEFT]
-            y = stats[label_idx, cv2.CC_STAT_TOP]
-            w = stats[label_idx, cv2.CC_STAT_WIDTH]
-            h = stats[label_idx, cv2.CC_STAT_HEIGHT]
-
-            component = binary_mask[y:y+h, x:x+w]
-
-            row_sum = np.sum(component, axis=1)
-            line_rows = row_sum > 0
-            empty_ratio = np.sum(~line_rows) / len(line_rows)
-
-            if empty_ratio > 0.45:
-                dotted_candidates += 1
-            else:
-                solid_candidates += 1
-
-        return dotted_candidates > solid_candidates and dotted_candidates > 0
-            
-
-    yellow_count, yellow_areas = count_lines_by_mask(yellow_lane_mask, area_threshold = 100)
-    yellow_count_for_type = min(yellow_count, 2)
-    valid_yellow_areas = [int(a) for a in yellow_areas if int(a) > 150]
-    valid_yellow_count = len(valid_yellow_areas)
-    valid_yellow_count_for_type = min(valid_yellow_count, 2)
-    white_count, white_areas = count_lines_by_mask(white_lane_mask, area_threshold = 200)
-
-    white_is_dotted = is_dotted_line(white_lane_mask)
-
-    yellow_area_sum = sum(valid_yellow_areas)
-    white_area_sum = sum([int(a) for a in white_areas])
-
-    white_is_dotted_by_count = white_count >= 4
-    white_is_dotted_final = white_is_dotted or white_is_dotted_by_count
-
-    if valid_yellow_count_for_type >= 2 or (yellow_count >= 2 and yellow_area_sum > 350):
-        line_type = "yellow_double"
-    elif white_count >= 2 and white_is_dotted_final and white_area_sum >= yellow_area_sum:
-        line_type = "white_dotted"
-    elif valid_yellow_count_for_type == 1 and yellow_area_sum > 8000:
-        line_type = "yellow_single"
-    elif white_count >= 1 and white_is_dotted_final:
-        line_type = "white_dotted"
-    else:
-        line_type = "none"
-        
     result = {
         "line_type": line_type,
-        "yellow_count": int(yellow_count),
-        "valid_yellow_count": int(valid_yellow_count),
-        "white_count": int(white_count),
-        "total_count": int(valid_yellow_count + white_count),
-        "white_is_dotted": bool(white_is_dotted_final),
-        "white_is_dotted_by_count": bool(white_is_dotted_by_count),
-        "yellow_area_sum": int(yellow_area_sum),
-        "white_area_sum": int(white_area_sum)
+        "confidence": float(confidence),
+        "candidate_count": len(candidate_results),
+        "candidates": candidate_results[:10]
     }
+
     return result
+        
+   

@@ -9,6 +9,11 @@ uploads/
 inference/output/
 
 weights/*.pth
+weights/*.onnx
+
+dataset/
+dataset_lane_crop/
+bdd100k/
 
 .DS_Store
 Thumbs.db
