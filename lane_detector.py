@@ -202,9 +202,21 @@ def run_lane_detection(image_path):
         interpolation=cv2.INTER_NEAREST
     )
 
+    h, w = mask_resized.shape
+
+    roi_mask = np.zeros_like(mask_resized)
+
+    x1 = int(w * 0.25)
+    x2 = int(w * 0.75)
+
+    y1 = 0
+    y2 = h
+
+    roi_mask[y1:y2, x1:x2] = mask_resized[y1:y2, x1:x2]
+
     lane_crops = extract_lane_candidate_crops(
         img_bgr=img_det,
-        lane_mask=mask_resized,
+        lane_mask=roi_mask,
         min_area=120,
         margin=80
     )
